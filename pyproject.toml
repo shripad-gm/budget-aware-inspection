@@ -1,0 +1,17 @@
+[project]
+name = "budget-aware-inspection"
+version = "0.1.0"
+description = "Streaming inspection gateway proof of concept"
+requires-python = ">=3.11"
+dependencies = ["confluent-kafka>=2.6,<3", "streamlit>=1.37,<2"]
+
+[project.scripts]
+inspection-gateway = "inspection_gateway.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["inspection_gateway*"]
+
