@@ -1,0 +1,15 @@
+From: Maya Rao <maya@example.org>
+To: team@example.org
+Date: Mon, 19 Oct 2026 09:30:00 +0530
+Subject: Project meeting agenda for Friday
+Message-ID: <meeting-invite-20261019@example.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hi team,
+
+Our project meeting is on Friday at 2:00 PM in Room 204. We will review the Kafka pipeline, the inspection rules, and the dashboard. Please bring any questions about the current workflow.
+
+Thanks,
+Maya

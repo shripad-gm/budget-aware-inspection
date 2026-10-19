@@ -1,12 +1,14 @@
-"""Run and observe the staged Kafka pipeline."""
+"""Run the staged Kafka pipeline and submit uploaded email files."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import threading
 from datetime import timedelta
+from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from confluent_kafka import Consumer, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from .core import Event, event_payload, utc_now
+from .mail import MAX_EMAIL_BYTES, parse_eml
 from .stream import (
     DECISIONS, ERRORS, INPUT, REQUESTS, RESULTS, SCREENED, TOPICS,
     StreamStore, deep_inspect, result_payload, schedule_once,
@@ -30,10 +33,10 @@ def publish(producer: Producer, topic: str, key: str, payload: dict) -> None:
         raise RuntimeError(f"Kafka publish failed for {topic}: {errors}")
 
 
-def consumer_for(bootstrap: str, stage: str, topics: list[str], run_scope: str | None = None) -> Consumer:
+def consumer_for(bootstrap: str, stage: str, topics: list[str]) -> Consumer:
     consumer = Consumer({
         "bootstrap.servers": bootstrap,
-        "group.id": f"inspection-{stage}-v2" + (f"-{run_scope}" if run_scope else ""),
+        "group.id": f"inspection-{stage}-v3",
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
     })
@@ -41,7 +44,7 @@ def consumer_for(bootstrap: str, stage: str, topics: list[str], run_scope: str |
     return consumer
 
 
-def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capacity: int, queue_limit: int, run_scope: str | None = None) -> None:
+def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capacity: int, queue_limit: int) -> None:
     subscriptions = {
         "screen": [INPUT],
         "schedule": [SCREENED, RESULTS],
@@ -49,7 +52,7 @@ def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capaci
         "finalize": [RESULTS],
     }
     store = StreamStore(db)
-    consumer = consumer_for(bootstrap, stage, subscriptions[stage], run_scope)
+    consumer = consumer_for(bootstrap, stage, subscriptions[stage])
     producer = Producer({"bootstrap.servers": bootstrap})
     send = lambda topic, key, payload: publish(producer, topic, key, payload)
     print(f"{stage} listening to {', '.join(subscriptions[stage])}", flush=True)
@@ -65,15 +68,11 @@ def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capaci
                     raise RuntimeError(str(message.error()))
                 try:
                     payload = json.loads(message.value())
-                    event_id = payload.get("event_id") or payload.get("event", {}).get("event_id")
-                    if run_scope and not str(event_id).startswith(run_scope + "-"):
-                        consumer.commit(message=message, asynchronous=False)
-                        continue
                     if stage == "screen":
                         screened = store.screen(payload)
                         event = Event.from_dict(screened["event"])
                         send(SCREENED, event.session_id, screened)
-                        print(f"screen {event.event_id}: {screened['screen']['disposition']}, deep={screened['screen']['requires_deep']}", flush=True)
+                        print(f"screen {event.event_id}: {screened['screen']['category']}, deep={screened['screen']['requires_deep']}", flush=True)
                     elif stage == "schedule" and message.topic() == SCREENED:
                         event = Event.from_dict(payload["event"])
                         state = store.enqueue(payload, queue_limit)
@@ -89,7 +88,7 @@ def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capaci
                         result = deep_inspect(payload)
                         event = Event.from_dict(payload["event"])
                         send(RESULTS, event.session_id, result)
-                        store.record_stage(event.event_id, "deep", result["disposition"])
+                        store.record_stage(event.event_id, "deep", result["disposition"], result["reason_code"])
                         print(f"deep {event.event_id}: {result['disposition']}", flush=True)
                     elif stage == "finalize":
                         decision = store.finalize(payload)
@@ -108,8 +107,7 @@ def run_stage(stage: str, bootstrap: str, db: str, stop: threading.Event, capaci
                     print(f"invalid message: {error}", file=sys.stderr, flush=True)
                 consumer.commit(message=message, asynchronous=False)
             if stage == "schedule":
-                effective_capacity = store.deep_capacity(capacity) if run_scope is None else capacity
-                schedule_once(store, send, effective_capacity)
+                schedule_once(store, send, store.deep_capacity(capacity))
     finally:
         consumer.close()
         store.close()
@@ -129,32 +127,47 @@ def create_topics(bootstrap: str) -> None:
                 raise
 
 
-def examples(run_id: str, deadline_seconds: int = 300) -> list[Event]:
-    deadline = (utc_now() + timedelta(seconds=deadline_seconds)).isoformat()
-    return [
-        Event(f"{run_id}-1", f"{run_id}-a", 1, "[[SEND:outsider@example.test]]", "summarize", (), deadline),
-        Event(f"{run_id}-2", f"{run_id}-b", 1, "Please send the meeting note.", "send", ("colleague@example.test",), deadline),
-        Event(f"{run_id}-3", f"{run_id}-a", 2, "[[BLOCK]] synthetic light block", "summarize", (), deadline),
-        Event(f"{run_id}-4", f"{run_id}-c", 1, "[[DEEP_BLOCK]] synthetic deep block", "summarize", (), deadline),
-        Event(f"{run_id}-5", f"{run_id}-d", 1, "[[DEEP]] synthetic deep release", "summarize", (), deadline),
-        Event(f"{run_id}-6", f"{run_id}-e", 1, "The project meeting is Tuesday at 10:00. Maya owns the agenda.", "lookup", (), deadline, "When is the project meeting?"),
-    ]
+def publish_eml(bootstrap: str, db: str, raw: bytes, task: str, recipient: str, question: str, deadline_seconds: int) -> str:
+    parsed = parse_eml(raw)
+    if task == "send" and not recipient.strip():
+        raise ValueError("A send task needs an allowed recipient")
+    if task == "lookup" and not question.strip():
+        raise ValueError("A lookup task needs a question")
+    create_topics(bootstrap)
+    event_id = "eml-" + uuid4().hex[:12]
+    event = Event(
+        event_id=event_id,
+        session_id=event_id,
+        sequence=1,
+        content=parsed.body,
+        task_type=task,
+        allowed_recipients=(recipient.strip(),) if task == "send" else (),
+        deadline=(utc_now() + timedelta(seconds=deadline_seconds)).isoformat(),
+        task_prompt=question.strip(),
+        sender=parsed.sender,
+        subject=parsed.subject,
+        message_date=parsed.message_date,
+        message_id=parsed.message_id,
+        source="uploaded_eml",
+    )
+    payload = event_payload(event)
+    payload.update({
+        "event_type": "email",
+        "replay_arrival_at": utc_now().isoformat(),
+        "content_ref": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "provenance_ref": "uploaded-eml",
+        "task_ref": f"task:{event_id}",
+    })
+    publish(Producer({"bootstrap.servers": bootstrap}), INPUT, event.session_id, payload)
+    store = StreamStore(db)
+    try:
+        store.record_stage(event_id, "producer", "published", INPUT)
+    finally:
+        store.close()
+    return event_id
 
 
-def produce_examples(bootstrap: str, run_id: str, deadline_seconds: int = 300) -> None:
-    producer = Producer({"bootstrap.servers": bootstrap})
-    for event in examples(run_id, deadline_seconds):
-        payload = event_payload(event)
-        payload["event_type"] = "email"
-        payload["replay_arrival_at"] = utc_now().isoformat()
-        payload["content_ref"] = f"synthetic:{event.event_id}"
-        payload["provenance_ref"] = "synthetic-demo-v1"
-        payload["task_ref"] = f"task:{event.event_id}"
-        publish(producer, INPUT, event.session_id, payload)
-        print(f"input {event.event_id} -> {INPUT}")
-
-
-def read_topic(bootstrap: str, topic: str, count: int, run_id: str | None) -> None:
+def read_topic(bootstrap: str, topic: str, count: int) -> None:
     consumer = Consumer({
         "bootstrap.servers": bootstrap,
         "group.id": f"inspection-observer-{uuid4()}",
@@ -170,11 +183,7 @@ def read_topic(bootstrap: str, topic: str, count: int, run_id: str | None) -> No
                 continue
             if message.error():
                 raise RuntimeError(str(message.error()))
-            payload = json.loads(message.value())
-            event_id = payload.get("event_id") or payload.get("event", {}).get("event_id")
-            if run_id and not str(event_id).startswith(run_id + "-"):
-                continue
-            print(json.dumps(payload))
+            print(json.dumps(json.loads(message.value())))
             seen += 1
     finally:
         consumer.close()
@@ -182,13 +191,13 @@ def read_topic(bootstrap: str, topic: str, count: int, run_id: str | None) -> No
         raise SystemExit(f"Read {seen}/{count} messages from {topic} within 15 seconds")
 
 
-def start_stages(stages: tuple[str, ...], bootstrap: str, db: str, capacity: int, queue_limit: int, run_scope: str | None = None):
+def start_stages(stages: tuple[str, ...], bootstrap: str, db: str, capacity: int, queue_limit: int):
     stop = threading.Event()
     errors = []
 
     def worker(stage: str) -> None:
         try:
-            run_stage(stage, bootstrap, db, stop, capacity, queue_limit, run_scope)
+            run_stage(stage, bootstrap, db, stop, capacity, queue_limit)
         except Exception as exc:
             errors.append((stage, exc))
             stop.set()
@@ -209,32 +218,38 @@ def finish_stages(stop: threading.Event, errors: list, threads: list[threading.T
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Staged Kafka inspection pipeline")
-    parser.add_argument("command", choices=("topics", "run", "produce", "read", "status", "demo"))
+    parser = argparse.ArgumentParser(description="Staged Kafka email-inspection pipeline")
+    parser.add_argument("command", choices=("topics", "run", "produce", "read", "status"))
     parser.add_argument("--bootstrap", default="localhost:9092")
-    parser.add_argument("--db", default="runtime/stream.sqlite3")
+    parser.add_argument("--db", default="runtime/mail_gateway.sqlite3")
     parser.add_argument("--stage", choices=("all", "screen", "schedule", "deep", "finalize"), default="all")
     parser.add_argument("--capacity", type=int, default=1)
     parser.add_argument("--queue-limit", type=int, default=64)
     parser.add_argument("--topic", choices=TOPICS, default=DECISIONS)
     parser.add_argument("--count", type=int, default=5)
-    parser.add_argument("--run-id")
-    parser.add_argument("--deadline-seconds", type=int, default=300)
+    parser.add_argument("--eml", type=Path)
+    parser.add_argument("--task", choices=("summarize", "lookup", "send"), default="summarize")
+    parser.add_argument("--recipient", default="")
+    parser.add_argument("--question", default="")
+    parser.add_argument("--deadline-seconds", type=int, default=120)
     args = parser.parse_args()
     if args.capacity < 0 or args.queue_limit < 1 or args.count < 1 or args.deadline_seconds < 1:
         parser.error("capacity must be nonnegative; queue-limit, count, and deadline-seconds must be positive")
     if args.command == "topics":
         create_topics(args.bootstrap)
     elif args.command == "produce":
-        run_id = args.run_id or uuid4().hex[:8]
-        print(f"run_id={run_id}")
-        produce_examples(args.bootstrap, run_id, args.deadline_seconds)
+        if args.eml is None:
+            parser.error("produce requires --eml PATH")
+        if args.eml.stat().st_size > MAX_EMAIL_BYTES:
+            parser.error("Email file must be no larger than 2 MB")
+        event_id = publish_eml(args.bootstrap, args.db, args.eml.read_bytes(), args.task, args.recipient, args.question, args.deadline_seconds)
+        print(f"{event_id} -> {INPUT}")
     elif args.command == "read":
-        read_topic(args.bootstrap, args.topic, args.count, args.run_id)
+        read_topic(args.bootstrap, args.topic, args.count)
     elif args.command == "status":
         store = StreamStore(args.db)
         try:
-            print(json.dumps({"queue": store.queue_status(), "mock_outbox": store.outbox(), "metrics": store.metrics(args.run_id)}, indent=2))
+            print(json.dumps({"queue": store.queue_status(), "draft_outbox": store.outbox(), "metrics": store.metrics()}, indent=2))
         finally:
             store.close()
     elif args.command == "run":
@@ -246,26 +261,6 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         finish_stages(stop, errors, threads)
-    elif args.command == "demo":
-        create_topics(args.bootstrap)
-        run_id = args.run_id or uuid4().hex[:8]
-        stages = ("screen", "schedule", "deep", "finalize")
-        stop, errors, threads = start_stages(stages, args.bootstrap, args.db, args.capacity, args.queue_limit, run_id)
-        try:
-            print(f"run_id={run_id}")
-            produce_examples(args.bootstrap, run_id, args.deadline_seconds)
-            print("final decisions:")
-            read_topic(args.bootstrap, DECISIONS, len(examples(run_id)), run_id)
-            store = StreamStore(args.db)
-            try:
-                print("mock outbox:")
-                print(json.dumps([item for item in store.outbox() if item["event_id"].startswith(run_id + "-")], indent=2))
-                print("stream metrics:")
-                print(json.dumps(store.metrics(run_id), indent=2))
-            finally:
-                store.close()
-        finally:
-            finish_stages(stop, errors, threads)
 
 
 if __name__ == "__main__":

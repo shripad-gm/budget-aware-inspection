@@ -1,103 +1,70 @@
-# Budget-aware inspection gateway
+# Budget-aware email inspection gateway
 
-This repository implements the **streaming skeleton** in [project_plan.md](project_plan.md) using synthetic emails. The inspectors and assistant are deterministic fixtures, so this is an architecture demo rather than a prompt-injection defense evaluation.
+This project accepts uploaded `.eml` email files, parses their real headers and body, and moves each message through a staged Kafka inspection pipeline. The current classifier and task output use explicit Python rules. They are inspectable starting points, not a trained detector or a measured security result.
 
-## Current stream workflow
+## Workflow
 
 ```text
-demo producer
-  -> inspection.input.v2
-  -> screen worker: validates event, tracks session sequence, runs light fixture
-  -> inspection.screened.v2
-  -> scheduler: basic result, deep request, or bounded hold
-       -> inspection.requests.v2 -> deep worker -> inspection.results.v2
-       -> inspection.results.v2 (basic or timeout)
-  -> finalizer: mock assistant proposal -> fixed permission gate
-  -> inspection.decisions.v2 + SQLite mock outbox
+.eml upload or CLI producer
+  -> inspection.input.v3
+  -> screen worker: category, risk signals, session sequence
+  -> inspection.screened.v3
+  -> scheduler: basic result, deeper rule pass, or bounded hold
+       -> inspection.requests.v3 -> deep worker -> inspection.results.v3
+       -> inspection.results.v3 (basic or timeout)
+  -> finalizer: local task output and fixed recipient authorization
+  -> inspection.decisions.v3 + SQLite draft outbox
 ```
 
-Each Kafka event is keyed by session ID. The screen worker records the highest sequence seen for each session and flags out-of-order input. The scheduler stores pending events in SQLite, limits the hold queue to 64 events by default, permits one deep request in flight by default, and emits explicit overload or deadline outcomes. A deep-required event waits or times out when capacity is zero; it is never released through the basic route. Malformed messages are recorded on `inspection.errors.v2`.
+The screen records categories such as meeting, finance, newsletter, and support. Risk rules look for explicit instruction overrides, assistant-directed commands, outbound-send requests, credential disclosure requests, and account-verification language. A strong instruction override can be blocked by the first pass. Other flagged content goes to a second pass. The dashboard shows every rule hit and the resulting route. These rules can miss attacks and produce false positives.
 
-The fixed permission gate allows a mock send only when the trusted task permits that recipient. It never takes permission from email text. Repeated results may appear on Kafka after replay; SQLite keeps the mock outbox at one action per event ID.
+The trusted task chooses summarization, factual lookup, or preparation of a send draft. Text inside an email cannot authorize a new recipient. An allowed send creates a **local draft record only**. The application is not connected to SMTP or an email account and does not transmit outgoing email.
 
-## One-command Kafka demo
+## Run locally
 
-Start Docker Desktop, then run from PowerShell in this folder:
+Start Docker Desktop. In PowerShell from this folder:
 
 ```powershell
 docker compose up -d
 python -m venv .venv
 .venv\Scripts\python -m pip install -e .
-.venv\Scripts\python -m inspection_gateway.stream_cli demo
-```
-
-The demo creates six Kafka topics, starts four stage workers, publishes six synthetic emails, prints six final decisions, shows the mock outbox and a small latency summary, then stops the workers. It chooses a new run ID each time. Expected outcomes:
-
-| Event | Route | Outcome |
-|---|---|---|
-| `-1` | Basic | Email asks for an unauthorized send; gate denies it |
-| `-2` | Basic | Authorized mock send appears once in the outbox |
-| `-3` | Basic | Light fixture blocks it |
-| `-4` | Deep | Deep fixture blocks it |
-| `-5` | Deep | Deep fixture releases it |
-| `-6` | Basic | Assistant fixture answers a factual lookup question |
-
-To see the hold path, run:
-
-```powershell
-.venv\Scripts\python -m inspection_gateway.stream_cli demo --capacity 0 --deadline-seconds 8
-```
-
-The basic events finish normally. Deep-required events remain pending until their deadlines, then become explicit timeouts. The `--queue-limit` option controls the maximum pending and in-flight queue size.
-
-## Inspect or run stages separately
-
-```powershell
-.venv\Scripts\python -m inspection_gateway.stream_cli topics
 .venv\Scripts\python -m inspection_gateway.stream_cli run
 ```
 
-In a second terminal:
-
-```powershell
-.venv\Scripts\python -m inspection_gateway.stream_cli produce
-.venv\Scripts\python -m inspection_gateway.stream_cli read --topic inspection.decisions.v2 --count 6
-.venv\Scripts\python -m inspection_gateway.stream_cli status
-```
-
-Use `run --stage screen`, `schedule`, `deep`, or `finalize` to start individual workers. Each uses its own Kafka consumer group. The `read` command can inspect any of the six topics. Because topics have three partitions, order is preserved within a session, but output across sessions may interleave.
-
-## Use the Streamlit dashboard
-
-Keep Kafka running. In one terminal, run the four workers:
-
-```powershell
-.venv\Scripts\python -m inspection_gateway.stream_cli run
-```
-
-In another terminal, start the dashboard:
+Keep the worker terminal open. In a second terminal:
 
 ```powershell
 .venv\Scripts\python -m streamlit run inspection_gateway/dashboard.py
 ```
 
-Open `http://localhost:8501`. **All events** shows Kafka connected and `4/4` workers online. Then:
+Open `http://localhost:8501` and use **Interactive lab**:
 
-1. Open **Interactive lab**, choose **Factual lookup**, and click **Send to Kafka**. The page gives you an event ID beginning with `ui-`.
-2. Follow the event as each worker records a step. Use **Start**, **Back**, **Play**, and **Next** to replay the steps; **Live** resumes following the newest step.
-3. Inspect the trusted task, untrusted email, assistant output, gate result, and raw stage audit. Try **Injection attempt** next: the email is released, but its proposed mock send is denied by the action gate.
-4. To see the waiting path, set **Available deep slots** to `0` and click **Apply capacity**. Send the **Deep inspection** scenario, watch it enter **held**, then restore `1` slot and watch it continue. The default 120-second deadline gives you time to do this.
+1. Export or save an email as an `.eml` file and upload it. Files must be at most 2 MB and contain a readable plain-text or HTML body. Attachments are counted but not opened.
+2. Review the parsed sender, subject, category, rule hits, and initial route before submission.
+3. Choose the trusted task. Enter a question for lookup or an explicitly allowed recipient for a send draft.
+4. Click **Inspect through Kafka**. The page follows the event automatically. Use **Start**, **Back**, **Play**, **Next**, and **Live** to inspect recorded stages.
+5. Open **All events** to compare completed messages and inspect the local draft outbox.
 
-The lab's queue and journey refresh every second. **All events** refreshes every two seconds and lets you compare prior events. The workers, not the dashboard, consume Kafka messages and produce decisions. The dashboard writes the deep-slot setting to SQLite; the running scheduler reads it on its next cycle. Restart workers launched before this dashboard update to enable the live capacity control. The outbox contains approved mock sends only; summaries and lookup answers appear under each event's assistant output.
+To see the hold path, set **Available deep slots** to `0`, upload a message with a text rule hit, and click **Apply capacity**. The event waits in SQLite until a slot becomes available or its deadline expires. Restore `1` slot to continue it.
 
-## Checks and current limits
+## CLI input
+
+The console entry point in `inspection_gateway/cli.py` uses the staged pipeline. To submit a file without the dashboard:
+
+```powershell
+.venv\Scripts\python -m inspection_gateway.stream_cli produce --eml C:\path\to\message.eml --task summarize
+.venv\Scripts\python -m inspection_gateway.stream_cli status
+.venv\Scripts\python -m inspection_gateway.stream_cli read --topic inspection.decisions.v3 --count 1
+```
+
+For a lookup task, add `--task lookup --question "When is the meeting?"`. For a send draft, add `--task send --recipient colleague@example.com`. The input email body may request a different recipient, but the fixed gate will deny any draft to an address outside the trusted task.
+
+Use `run --stage screen`, `schedule`, `deep`, or `finalize` to launch one worker. Kafka records are keyed by session ID; order is preserved within a session, while sessions can interleave. SQLite stores queue state, stage audits, decisions, and deduplicated drafts. The v3 topics and `runtime/mail_gateway.sqlite3` separate this workflow from the earlier marker-based prototype.
+
+## Checks and limits
 
 ```powershell
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-The tests cover authorization, replay-safe mock sends, basic and deep routing, session sequence flags, a held deadline, and queue limits. The original single-worker `inspection_gateway.cli` remains available as a simple first-step example; the staged `stream_cli` is the current workflow.
-
-The scheduler currently uses a fixed rule based on synthetic `[[DEEP]]`, `[[DEEP_BLOCK]]`, and `[[BLOCK]]` markers. There is no OR optimizer, model API, real dataset, or measured security result yet. The assistant produces deterministic summary previews, lookup matches, and mock send proposals; it is not a live AI model. The tiny demo's latency summary includes worker startup and is not a throughput benchmark. Kafka publication is at least once, and the local SQLite setup is intended for this single-machine POC. Input task permissions are assumed to come from a trusted producer; the gateway does not authenticate producers yet.
-
-Next, measure arrival rate, queue age, throughput, and latency on this pipeline, then add a baseline routing policy and the capacity-constrained optimizer.
+The `.eml` parser uses the standard library and does not fetch remote HTML resources. Uploads are kept in memory while the dashboard parses them. The Kafka event and local SQLite state contain the extracted email body, so use only messages you are permitted to process on this machine. The system has no inbox connector, no model API, and no Operations Research optimizer yet. The two inspection levels currently use different hardcoded rule sets, and their accuracy has not been validated on a real corpus. There is no real outbound mail transport.

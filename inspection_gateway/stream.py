@@ -1,8 +1,4 @@
-"""Kafka streaming stages with durable local queue state.
-
-Screening, deep inspection, and assistant behavior are synthetic fixtures. The
-streaming boundaries, deadlines, capacity, and idempotent mock actions are real.
-"""
+"""Kafka streaming stages with durable local queue state and email rules."""
 
 from __future__ import annotations
 
@@ -10,19 +6,19 @@ import json
 import math
 import sqlite3
 import threading
-import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .core import Event, assistant_fixture, authorize_action, parse_time, utc_now
+from .core import Event, assistant_rules, authorize_action, parse_time, utc_now
+from .mail import classify_email, deep_inspection
 
-INPUT = "inspection.input.v2"
-SCREENED = "inspection.screened.v2"
-REQUESTS = "inspection.requests.v2"
-RESULTS = "inspection.results.v2"
-DECISIONS = "inspection.decisions.v2"
-ERRORS = "inspection.errors.v2"
+INPUT = "inspection.input.v3"
+SCREENED = "inspection.screened.v3"
+REQUESTS = "inspection.requests.v3"
+RESULTS = "inspection.results.v3"
+DECISIONS = "inspection.decisions.v3"
+ERRORS = "inspection.errors.v3"
 TOPICS = (INPUT, SCREENED, REQUESTS, RESULTS, DECISIONS, ERRORS)
 _INIT_LOCK = threading.Lock()
 
@@ -48,7 +44,13 @@ class StreamStore:
             self.db.execute("""CREATE TABLE IF NOT EXISTS decisions (
                 event_id TEXT PRIMARY KEY, payload TEXT NOT NULL
             )""")
-            self.db.execute("""CREATE TABLE IF NOT EXISTS mock_outbox (
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mock_outbox'").fetchone():
+                if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='draft_outbox'").fetchone():
+                    self.db.execute("INSERT OR IGNORE INTO draft_outbox SELECT * FROM mock_outbox")
+                    self.db.execute("DROP TABLE mock_outbox")
+                else:
+                    self.db.execute("ALTER TABLE mock_outbox RENAME TO draft_outbox")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS draft_outbox (
                 event_id TEXT PRIMARY KEY, recipient TEXT NOT NULL, body TEXT NOT NULL
             )""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS stage_events (
@@ -117,14 +119,12 @@ class StreamStore:
             "SELECT max_sequence FROM session_state WHERE session_id=?", (event.session_id,)
         ).fetchone()
         sequence_status = "out_of_order" if previous and event.sequence <= previous[0] else "in_order"
-        needs_deep = "[[DEEP]]" in event.content or "[[DEEP_BLOCK]]" in event.content
-        basic = "block" if "[[BLOCK]]" in event.content else "release"
+        rules = classify_email(event.sender, event.subject, event.content)
         payload = {
             "event": raw,
             "screen": {
-                "inspector": "fixture-light-v1",
-                "disposition": basic,
-                "requires_deep": needs_deep,
+                "inspector": "rules-light-v1",
+                **rules,
                 "sequence_status": sequence_status,
                 "screened_at": utc_now().isoformat(),
             },
@@ -184,7 +184,7 @@ class StreamStore:
         now = utc_now()
         expired = now >= parse_time(event.deadline)
         disposition = "timeout" if expired else result["disposition"]
-        assistant_output, proposal = assistant_fixture(event) if disposition == "release" else (None, None)
+        assistant_output, proposal = assistant_rules(event) if disposition == "release" else (None, None)
         gate_outcome = authorize_action(event, proposal)
         decision = {
             "event_id": event.event_id,
@@ -203,13 +203,13 @@ class StreamStore:
             self.db.execute("INSERT OR IGNORE INTO decisions VALUES (?, ?)", (event.event_id, json.dumps(decision)))
             if gate_outcome == "allowed" and proposal:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO mock_outbox VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO draft_outbox VALUES (?, ?, ?)",
                     (event.event_id, proposal["recipient"], proposal["body"]),
                 )
         return decision
 
     def outbox(self) -> list[dict[str, str]]:
-        rows = self.db.execute("SELECT event_id, recipient, body FROM mock_outbox ORDER BY event_id").fetchall()
+        rows = self.db.execute("SELECT event_id, recipient, body FROM draft_outbox ORDER BY event_id").fetchall()
         return [dict(zip(("event_id", "recipient", "body"), row)) for row in rows]
 
     def queue_status(self) -> list[dict[str, str]]:
@@ -218,7 +218,8 @@ class StreamStore:
 
     def timeline(self, event_id: str) -> list[dict[str, str]]:
         rows = self.db.execute(
-            "SELECT stage, status, recorded_at, detail FROM stage_events WHERE event_id=? ORDER BY recorded_at, rowid",
+            """SELECT stage, status, recorded_at, detail FROM stage_events WHERE event_id=?
+            ORDER BY CASE WHEN stage='producer' THEN 0 ELSE 1 END, recorded_at, rowid""",
             (event_id,),
         ).fetchall()
         return [dict(zip(("stage", "status", "recorded_at", "detail"), row)) for row in rows]
@@ -241,6 +242,10 @@ class StreamStore:
                 "task_type": event["task_type"],
                 "task_prompt": event.get("task_prompt", ""),
                 "allowed_recipients": event.get("allowed_recipients", []),
+                "sender": event.get("sender", ""),
+                "subject": event.get("subject", ""),
+                "message_date": event.get("message_date", ""),
+                "source": event.get("source", ""),
                 "content": event["content"],
                 "screen": screened["screen"],
                 "queue_state": queue_state,
@@ -283,7 +288,7 @@ def result_payload(screened: dict[str, Any], route: str, disposition: str, reaso
         "disposition": disposition,
         "reason_code": reason,
         "queue_age_ms": age,
-        "inspector": "fixture-deep-v1" if route == "deep" else "fixture-light-v1",
+        "inspector": "rules-deep-v1" if route == "deep" else "rules-light-v1",
         "completed_at": utc_now().isoformat(),
     }
 
@@ -307,7 +312,7 @@ def schedule_once(store: StreamStore, publish, deep_capacity: int) -> None:
             store.mark(event.event_id, "complete")
             store.record_stage(event.event_id, "scheduler", "timeout")
         elif not screened["screen"]["requires_deep"]:
-            result = result_payload(screened, "basic", screened["screen"]["disposition"], "fixture_basic", item["enqueued_at"])
+            result = result_payload(screened, "basic", screened["screen"]["disposition"], screened["screen"]["reason_code"], item["enqueued_at"])
             publish(RESULTS, event.session_id, result)
             store.mark(event.event_id, "complete")
             store.record_stage(event.event_id, "scheduler", "basic")
@@ -321,12 +326,11 @@ def schedule_once(store: StreamStore, publish, deep_capacity: int) -> None:
             store.record_stage(event.event_id, "scheduler", "held", "deep_capacity_exhausted")
 
 
-def deep_inspect(request: dict[str, Any], delay_seconds: float = 0.25) -> dict[str, Any]:
+def deep_inspect(request: dict[str, Any]) -> dict[str, Any]:
     event = Event.from_dict(request["event"])
-    time.sleep(delay_seconds)
-    disposition = "block" if "[[DEEP_BLOCK]]" in event.content else "release"
+    disposition, reason = deep_inspection(event.subject, event.content)
     return result_payload(
         {"event": request["event"]}, "deep", disposition,
-        "fixture_deep_block" if disposition == "block" else "fixture_deep_release",
+        reason,
         request["enqueued_at"],
     )

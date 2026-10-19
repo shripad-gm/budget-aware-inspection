@@ -2,7 +2,7 @@
 
 **Working research title:** Budget-Aware Streaming Inspection for AI Email Assistants Against Indirect Prompt Injection  
 **Duration:** Four weeks  
-**Status:** Proposed proof of concept; implementation and experimental validation pending  
+**Status:** Kafka and local `.eml` inspection prototype implemented; optimizer, model integration, and experimental validation pending  
 **Planning assumptions:** Two or three students, laptop development, public datasets, and limited model API access  
 **Subject priority:** Stream Processing and Analytics → Operations Research → Ethical AI
 
@@ -16,7 +16,7 @@ The gateway will inspect incoming content, decide which cases need deeper inspec
 
 The intended research contribution is **how to schedule security inspection under changing traffic and resource limits**. We will reuse existing models rather than train a new foundation model.
 
-The POC will use dummy destinations and a local mock outbox. It will not connect to a real email account or send actual messages.
+The current POC accepts exported `.eml` messages with their real headers and body. It uses explicit local classification and inspection rules, and saves authorized send drafts in a local outbox. It does not connect to an email account or send actual messages.
 
 ## 2. Why this problem matters
 

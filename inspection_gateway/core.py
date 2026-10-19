@@ -1,8 +1,4 @@
-"""Deterministic, locally testable gateway core.
-
-The inspector and assistant here are fixtures. They are deliberately not presented
-as security models; their purpose is to exercise the transport and permission gate.
-"""
+"""Event schema, rule-based task output, and fixed action authorization."""
 
 from __future__ import annotations
 
@@ -14,18 +10,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-SEND_MARKER = re.compile(r"\[\[SEND:([^\]]+)\]\]")
-FIXTURE_MARKER = re.compile(r"\[\[(?:SEND:[^\]]+|BLOCK|DEEP|DEEP_BLOCK)\]\]")
-
+from .mail import classify_email, deep_inspection, requested_recipient
 
 def propose_action(event: "Event") -> dict[str, str] | None:
-    """Fixture assistant; email markers intentionally test the fixed gate."""
-    marker = SEND_MARKER.search(event.content)
-    if marker:
-        return {"action": "send", "recipient": marker.group(1).strip(), "body": "Synthetic mock message"}
-    if event.task_type == "send" and event.allowed_recipients:
-        return {"action": "send", "recipient": event.allowed_recipients[0], "body": "Synthetic mock message"}
+    """Extract a candidate from email text, or draft for a trusted send task."""
+    recipient = requested_recipient(event.content)
+    if recipient is None and event.task_type == "send" and event.allowed_recipients:
+        recipient = event.allowed_recipients[0]
+    if recipient:
+        return {
+            "action": "send",
+            "recipient": recipient,
+            "body": f"Subject: Fwd: {event.subject or '(no subject)'}\n\n{event.content[:2000]}",
+        }
     return None
 
 
@@ -35,12 +32,14 @@ def authorize_action(event: "Event", proposal: dict[str, str] | None) -> str:
     return "allowed" if event.task_type == "send" and proposal["recipient"] in event.allowed_recipients else "denied"
 
 
-def assistant_fixture(event: "Event") -> tuple[str, dict[str, str] | None]:
-    """Deterministic task output for displaying the agent boundary in the POC."""
+def assistant_rules(event: "Event") -> tuple[str, dict[str, str] | None]:
+    """Produce a simple local summary, lookup answer, or send draft."""
     proposal = propose_action(event)
-    clean_content = FIXTURE_MARKER.sub("", event.content).strip()
+    clean_content = event.content.strip()
     if event.task_type == "summarize":
-        return (f"Summary preview: {clean_content[:180]}" if clean_content else "No readable email text to summarize."), proposal
+        sentences = [piece.strip() for piece in re.split(r"(?<=[.!?])\s+|\n+", clean_content) if piece.strip()]
+        preview = " ".join(sentences[:2])[:300]
+        return (f"Summary: {preview}" if preview else "No readable email text to summarize."), proposal
     if event.task_type == "lookup":
         terms = {
             term.lower() for term in re.findall(r"[A-Za-z]{3,}", event.task_prompt)
@@ -50,7 +49,7 @@ def assistant_fixture(event: "Event") -> tuple[str, dict[str, str] | None]:
         match = next((sentence for sentence in sentences if any(term in sentence.lower() for term in terms)), None)
         return (f"Found in email: {match}" if match else "No matching fact found in this email."), proposal
     recipient = proposal["recipient"] if proposal else "no recipient"
-    return f"Prepared a mock send to {recipient}.", proposal
+    return f"Draft ready for {recipient}; the local authorization gate will check it.", proposal
 
 
 def utc_now() -> datetime:
@@ -74,6 +73,11 @@ class Event:
     allowed_recipients: tuple[str, ...]
     deadline: str
     task_prompt: str = ""
+    sender: str = ""
+    subject: str = ""
+    message_date: str = ""
+    message_id: str = ""
+    source: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Event":
@@ -91,6 +95,9 @@ class Event:
         task_prompt = data.get("task_prompt", "")
         if not isinstance(task_prompt, str):
             raise ValueError("task_prompt must be a string")
+        optional = ("sender", "subject", "message_date", "message_id", "source")
+        if any(not isinstance(data.get(name, ""), str) for name in optional):
+            raise ValueError("email metadata must be strings")
         recipients = data.get("allowed_recipients", [])
         if not isinstance(recipients, list) or not all(isinstance(item, str) for item in recipients):
             raise ValueError("allowed_recipients must be a list of strings")
@@ -104,6 +111,11 @@ class Event:
             allowed_recipients=tuple(recipients),
             deadline=data["deadline"],
             task_prompt=task_prompt,
+            sender=data.get("sender", ""),
+            subject=data.get("subject", ""),
+            message_date=data.get("message_date", ""),
+            message_id=data.get("message_id", ""),
+            source=data.get("source", ""),
         )
 
 
@@ -117,7 +129,13 @@ class GatewayStore:
             event_id TEXT PRIMARY KEY, inspection_json TEXT NOT NULL,
             decision_json TEXT NOT NULL
         )""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS mock_outbox (
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mock_outbox'").fetchone():
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='draft_outbox'").fetchone():
+                self.db.execute("INSERT OR IGNORE INTO draft_outbox SELECT * FROM mock_outbox")
+                self.db.execute("DROP TABLE mock_outbox")
+            else:
+                self.db.execute("ALTER TABLE mock_outbox RENAME TO draft_outbox")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS draft_outbox (
             event_id TEXT PRIMARY KEY, recipient TEXT NOT NULL, body TEXT NOT NULL
         )""")
         self.db.commit()
@@ -137,26 +155,32 @@ class GatewayStore:
             return existing
         now = now or utc_now()
         expired = now >= parse_time(event.deadline)
-        # Stub inspector: [[BLOCK]] is a synthetic test signal, not a detector.
-        disposition = "timeout" if expired else ("block" if "[[BLOCK]]" in event.content else "release")
+        screen = classify_email(event.sender, event.subject, event.content)
+        disposition = "timeout" if expired else screen["disposition"]
+        if not expired and screen["requires_deep"]:
+            disposition, reason = deep_inspection(event.subject, event.content)
+        else:
+            reason = screen["reason_code"]
         inspection = {
             "event_id": event.event_id,
             "session_id": event.session_id,
-            "inspector": "fixture-v1",
+            "inspector": "rules-v1",
+            "category": screen["category"],
+            "signals": screen["signals"],
             "disposition": disposition,
-            "reason_code": "deadline_expired" if expired else ("fixture_block" if disposition == "block" else "fixture_release"),
+            "reason_code": "deadline_expired" if expired else reason,
         }
         proposal: dict[str, str] | None = None
         assistant_output: str | None = None
         gate_outcome = "not_applicable"
         if disposition == "release":
-            assistant_output, proposal = assistant_fixture(event)
+            assistant_output, proposal = assistant_rules(event)
             gate_outcome = authorize_action(event, proposal)
         decision = {
             "event_id": event.event_id,
             "session_id": event.session_id,
             "sequence": event.sequence,
-            "route": "fixture_basic",
+            "route": "deep" if screen["requires_deep"] else "basic",
             "disposition": disposition,
             "proposed_action": proposal,
             "assistant_output": assistant_output,
@@ -170,13 +194,13 @@ class GatewayStore:
             )
             if gate_outcome == "allowed" and proposal is not None:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO mock_outbox VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO draft_outbox VALUES (?, ?, ?)",
                     (event.event_id, proposal["recipient"], proposal["body"]),
                 )
         return self.get(event.event_id)  # type: ignore[return-value]
 
     def outbox(self) -> list[dict[str, str]]:
-        rows = self.db.execute("SELECT event_id, recipient, body FROM mock_outbox ORDER BY event_id").fetchall()
+        rows = self.db.execute("SELECT event_id, recipient, body FROM draft_outbox ORDER BY event_id").fetchall()
         return [dict(zip(("event_id", "recipient", "body"), row)) for row in rows]
 
 
